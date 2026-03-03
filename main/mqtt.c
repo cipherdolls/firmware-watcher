@@ -185,8 +185,11 @@ static void metrics_task(void *arg)
 
 static void mqtt_connect_task(void *arg)
 {
-    xEventGroupWaitBits(g_events, EVT_DOLL_READY,
-                        pdFALSE, pdFALSE, portMAX_DELAY);
+    // Wait for doll registration AND image downloads to finish before connecting.
+    // Image downloads use TLS which needs most of internal SRAM for RSA operations;
+    // MQTT socket allocation during that window causes PK verify failures.
+    xEventGroupWaitBits(g_events, EVT_DOLL_READY | EVT_IMAGES_DONE,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
 
     snprintf(s_client_id, sizeof(s_client_id), "doll_%s", g_config.doll_id);
 
@@ -203,14 +206,24 @@ static void mqtt_connect_task(void *arg)
     esp_mqtt_client_start(s_client);
     ESP_LOGI(TAG, "Connecting to %s as %s", g_config.mqtt_url, s_client_id);
 
-    xTaskCreate(metrics_task, "mqtt_metrics", 4096, NULL, 2, NULL);
+    static StaticTask_t s_metrics_tcb;
+    StackType_t *mstack = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (mstack) {
+        xTaskCreateStaticPinnedToCore(metrics_task, "mqtt_metrics",
+            4096 / sizeof(StackType_t), NULL, 2, mstack, &s_metrics_tcb, 1);
+    }
 
     vTaskDelete(NULL);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+static StaticTask_t s_mqtt_tcb;
+
 void mqtt_start(void)
 {
-    xTaskCreate(mqtt_connect_task, "mqtt_connect", 4096, NULL, 3, NULL);
+    StackType_t *stack = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(stack);
+    xTaskCreateStaticPinnedToCore(mqtt_connect_task, "mqtt_connect",
+        4096 / sizeof(StackType_t), NULL, 3, stack, &s_mqtt_tcb, 1);
 }

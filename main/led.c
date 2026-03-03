@@ -29,9 +29,11 @@ void led_task_fn(void *pvParameter)
     bool led_on = false;
     while (1) {
         EventBits_t bits = xEventGroupGetBits(g_events);
-        bool connected = (bits & EVT_WIFI_GOT_IP) != 0;
-        bool recording = (bits & EVT_AUDIO_RECORDING) != 0;
-        bool playing   = (bits & EVT_AUDIO_PLAYING) != 0;
+        bool connected      = (bits & EVT_WIFI_GOT_IP) != 0;
+        bool recording       = (bits & EVT_AUDIO_RECORDING) != 0;
+        bool playing         = (bits & EVT_AUDIO_PLAYING) != 0;
+        bool conv_listening  = (bits & EVT_CONV_LISTENING) != 0;
+        bool conv_mode       = (bits & EVT_CONV_MODE) != 0;
 
         if (recording) {
             // Solid red while recording
@@ -41,6 +43,16 @@ void led_task_fn(void *pvParameter)
         } else if (playing) {
             // Solid blue while playing
             led_strip_set_pixel(strip, 0, 0, 0, 30);
+            led_strip_refresh(strip);
+            led_on = true;
+        } else if (conv_listening) {
+            // Solid green — listening for speech
+            led_strip_set_pixel(strip, 0, 0, 30, 0);
+            led_strip_refresh(strip);
+            led_on = true;
+        } else if (conv_mode) {
+            // Dim green — waiting for server response
+            led_strip_set_pixel(strip, 0, 0, 15, 0);
             led_strip_refresh(strip);
             led_on = true;
         } else if (connected) {

@@ -13,5 +13,8 @@
 #define EVT_AUDIO_RECORDING     (1 << 7)
 #define EVT_DEEP_SLEEP          (1 << 8)
 #define EVT_DOLL_READY          (1 << 9)   // doll_id confirmed with backend
+#define EVT_CONV_MODE           (1 << 10)  // conversation mode active
+#define EVT_CONV_LISTENING      (1 << 11)  // listening for speech (green LED)
+#define EVT_IMAGES_DONE         (1 << 12)  // avatar+scenario download finished
 
 extern EventGroupHandle_t g_events;

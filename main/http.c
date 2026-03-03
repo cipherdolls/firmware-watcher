@@ -7,6 +7,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_mac.h"
 #include "esp_sntp.h"
 #include "cJSON.h"
@@ -249,7 +250,13 @@ done:
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+// Use PSRAM stack to keep internal SRAM free for TLS RSA operations
+static StaticTask_t s_sync_tcb;
+
 void http_sync_doll(void)
 {
-    xTaskCreate(sync_task, "http_sync", 8192, NULL, 3, NULL);
+    StackType_t *stack = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(stack);
+    xTaskCreateStaticPinnedToCore(sync_task, "http_sync",
+        8192 / sizeof(StackType_t), NULL, 3, stack, &s_sync_tcb, 1);
 }

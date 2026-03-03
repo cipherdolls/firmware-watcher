@@ -1,6 +1,7 @@
 #include "scenario_img.h"
 #include "board.h"
 #include "config.h"
+#include "events.h"
 #include "display.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -192,10 +193,19 @@ static void scenario_task(void *arg)
     display_set_scenario(fb, jdec.width, jdec.height);
 
 done:
+    // Signal that all image downloads are complete — MQTT can now safely connect
+    xEventGroupSetBits(g_events, EVT_IMAGES_DONE);
     vTaskDelete(NULL);
 }
 
+// Use PSRAM stack to keep internal SRAM free for TLS operations
+static StaticTask_t s_scenario_tcb;
+
 void scenario_img_start(void)
 {
-    xTaskCreate(scenario_task, "scenario_dl", 8192, NULL, 3, NULL);
+    StackType_t *stack = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stack) {
+        xTaskCreateStaticPinnedToCore(scenario_task, "scenario_dl",
+            8192 / sizeof(StackType_t), NULL, 3, stack, &s_scenario_tcb, 1);
+    }
 }

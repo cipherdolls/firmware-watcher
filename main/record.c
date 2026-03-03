@@ -14,9 +14,11 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "freertos/stream_buffer.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 static const char *TAG = "record";
 
@@ -28,11 +30,33 @@ static const char *TAG = "record";
 
 #define ES7243_ADDR  0x14   // Confirmed by I2C scan on SenseCAP Watcher
 
+// ── VAD configuration ────────────────────────────────────────────────────────
+
+#define VAD_RMS_THRESHOLD       200     // RMS level above which speech is detected
+#define VAD_SILENCE_TIMEOUT_MS  1500    // 1.5 s of silence ends recording
+#define VAD_CONFIRM_CHUNKS      3       // ~96 ms of consecutive speech to confirm onset
+#define LISTEN_TIMEOUT_S        60      // Max time in LISTENING before auto-exit
+#define WAIT_RESPONSE_TIMEOUT_S 30      // Max time waiting for server response
+
+// Pre-speech circular buffer — captures ~300 ms before VAD triggers
+#define PRE_SPEECH_BYTES  (10 * 1024)   // ~312 ms at 16 kHz mono 16-bit
+
+typedef enum {
+    CONV_OFF,
+    CONV_LISTENING,
+    CONV_RECORDING,
+    CONV_WAITING,
+    CONV_PLAYING,
+} conv_state_t;
+
+static volatile conv_state_t s_conv_state = CONV_OFF;
+
+// ── Shared state ─────────────────────────────────────────────────────────────
+
 static i2s_chan_handle_t s_rx_chan  = NULL;
 static bool             s_mic_init = false;
 
-// ── Ring buffer for Core 0 → Core 1 audio transfer ─────────────────────────
-
+// Ring buffer for Core 0 → Core 1 audio transfer
 static StreamBufferHandle_t s_ring_buf;
 static StaticStreamBuffer_t s_ring_struct;
 static uint8_t             *s_ring_storage;
@@ -42,6 +66,23 @@ static volatile bool        s_reader_running;
 #define READER_STACK_WORDS 2048   // 2048 words = 8 KB stack
 static StackType_t         *s_reader_stack;
 static StaticTask_t         s_reader_tcb;
+
+// Pre-speech circular buffer
+static uint8_t  *s_pre_buf;
+static size_t    s_pre_write;
+static size_t    s_pre_fill;
+
+// VAD event group (reader → main task signaling)
+static EventGroupHandle_t s_vad_events;
+#define VAD_EVT_SPEECH   (1 << 0)
+#define VAD_EVT_SILENCE  (1 << 1)
+
+static volatile uint32_t s_speech_chunks;  // consecutive loud chunks counter
+static TimerHandle_t     s_silence_timer;
+static TickType_t        s_wait_start;
+
+// Send buffer (allocated once, reused)
+static uint8_t *s_send_buf;
 
 // ── WAV header ────────────────────────────────────────────────────────────────
 
@@ -140,7 +181,7 @@ static void es7243e_init(void)
     ESP_LOGI(TAG, "ES7243E init done (addr=0x%02X, chip ID 0x7A43)", ES7243_ADDR);
 }
 
-// ── Knob button — press to record, release to send ──────────────────────────
+// ── Knob button ──────────────────────────────────────────────────────────────
 
 static bool s_knob_btn_ok = false;
 
@@ -251,7 +292,57 @@ static void restore_idle_display(void)
     display_set_state(DISPLAY_STATE_WIFI_OK, msg);
 }
 
-// ── I2S reader task — runs on Core 0, feeds ring buffer ─────────────────────
+// ── VAD helpers ──────────────────────────────────────────────────────────────
+
+static uint16_t compute_rms(const int16_t *samples, size_t count)
+{
+    if (count == 0) return 0;
+    uint64_t sum_sq = 0;
+    for (size_t i = 0; i < count; i++) {
+        int32_t s = samples[i];
+        sum_sq += (uint64_t)(s * s);
+    }
+    return (uint16_t)sqrtf((float)sum_sq / count);
+}
+
+static void pre_buf_write(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        s_pre_buf[s_pre_write] = data[i];
+        s_pre_write = (s_pre_write + 1) % PRE_SPEECH_BYTES;
+    }
+    s_pre_fill += len;
+    if (s_pre_fill > PRE_SPEECH_BYTES) s_pre_fill = PRE_SPEECH_BYTES;
+}
+
+static size_t pre_buf_drain_to_ring(void)
+{
+    if (s_pre_fill == 0) return 0;
+    size_t start = (s_pre_write + PRE_SPEECH_BYTES - s_pre_fill) % PRE_SPEECH_BYTES;
+    size_t to_read = s_pre_fill;
+
+    // Send in two parts if wrapping
+    if (start + to_read <= PRE_SPEECH_BYTES) {
+        xStreamBufferSend(s_ring_buf, s_pre_buf + start, to_read, pdMS_TO_TICKS(100));
+    } else {
+        size_t first = PRE_SPEECH_BYTES - start;
+        xStreamBufferSend(s_ring_buf, s_pre_buf + start, first, pdMS_TO_TICKS(50));
+        xStreamBufferSend(s_ring_buf, s_pre_buf, to_read - first, pdMS_TO_TICKS(50));
+    }
+
+    size_t drained = s_pre_fill;
+    s_pre_fill = 0;
+    s_pre_write = 0;
+    return drained;
+}
+
+static void silence_timer_cb(TimerHandle_t timer)
+{
+    // Keep lightweight — timer service task has a small stack (2 KB)
+    xEventGroupSetBits(s_vad_events, VAD_EVT_SILENCE);
+}
+
+// ── I2S reader task — runs on Core 0, feeds ring buffer / pre-buf ───────────
 
 static void i2s_reader_task(void *arg)
 {
@@ -276,8 +367,34 @@ static void i2s_reader_task(void *arg)
         }
         size_t mono_bytes = n_mono * 2;
 
-        // Write to ring buffer — blocks briefly if full, drops data after 50 ms
-        xStreamBufferSend(s_ring_buf, buf, mono_bytes, pdMS_TO_TICKS(50));
+        // Compute RMS for VAD
+        uint16_t rms = compute_rms(s, n_mono);
+        bool loud = (rms > VAD_RMS_THRESHOLD);
+
+        conv_state_t state = s_conv_state;
+
+        if (state == CONV_LISTENING) {
+            // Write to pre-speech circular buffer (overwrites oldest)
+            pre_buf_write(buf, mono_bytes);
+
+            // Track consecutive loud chunks for speech onset
+            if (loud) {
+                s_speech_chunks++;
+                if (s_speech_chunks >= VAD_CONFIRM_CHUNKS) {
+                    xEventGroupSetBits(s_vad_events, VAD_EVT_SPEECH);
+                }
+            } else {
+                s_speech_chunks = 0;
+            }
+        } else if (state == CONV_RECORDING) {
+            // Write to ring buffer for WS streaming
+            xStreamBufferSend(s_ring_buf, buf, mono_bytes, pdMS_TO_TICKS(50));
+
+            // Reset silence timer on loud chunks
+            if (loud) {
+                xTimerReset(s_silence_timer, 0);
+            }
+        }
     }
 
     heap_caps_free(buf);
@@ -285,194 +402,413 @@ static void i2s_reader_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ── Record task — multicore: reader on Core 0, WS sender on Core 1 ─────────
+// ── WebSocket URL builder ────────────────────────────────────────────────────
+
+static void build_ws_url(char *url, size_t url_size)
+{
+    if (strncmp(g_config.stream_recorder_url, "https://", 8) == 0) {
+        snprintf(url, url_size, "wss://%s/ws-stream?chatId=%s&auth=%s",
+                 g_config.stream_recorder_url + 8, g_config.chat_id, g_config.apikey);
+    } else if (strncmp(g_config.stream_recorder_url, "http://", 7) == 0) {
+        snprintf(url, url_size, "ws://%s/ws-stream?chatId=%s&auth=%s",
+                 g_config.stream_recorder_url + 7, g_config.chat_id, g_config.apikey);
+    } else {
+        snprintf(url, url_size, "ws://%s/ws-stream?chatId=%s&auth=%s",
+                 g_config.stream_recorder_url, g_config.chat_id, g_config.apikey);
+    }
+}
+
+// ── Start listening (I2S RX + reader task) ───────────────────────────────────
+
+static void start_listening(void)
+{
+    audio_speaker_mute();
+    i2s_rx_start();
+    if (!s_mic_init) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        es7243e_init();
+        s_mic_init = true;
+    }
+
+    xStreamBufferReset(s_ring_buf);
+    s_pre_fill = 0;
+    s_pre_write = 0;
+    s_speech_chunks = 0;
+    xEventGroupClearBits(s_vad_events, VAD_EVT_SPEECH | VAD_EVT_SILENCE);
+
+    s_conv_state = CONV_LISTENING;
+    s_reader_running = true;
+    xTaskCreateStaticPinnedToCore(i2s_reader_task, "i2s_rd",
+        READER_STACK_WORDS, NULL, 5,
+        s_reader_stack, &s_reader_tcb, 0);
+
+    xEventGroupSetBits(g_events, EVT_CONV_LISTENING);
+    display_set_state(DISPLAY_STATE_WIFI_OK, "Listening...");
+    ESP_LOGI(TAG, "Listening for speech...");
+}
+
+// ── Stop listening (I2S RX + reader task) ────────────────────────────────────
+
+static void stop_listening(void)
+{
+    s_reader_running = false;
+    vTaskDelay(pdMS_TO_TICKS(300));  // wait for reader task to exit
+    i2s_rx_stop();
+    xEventGroupClearBits(g_events, EVT_CONV_LISTENING);
+}
+
+// ── Record and send via WebSocket ────────────────────────────────────────────
+// Returns true if a meaningful recording was sent, false if too short / error.
+
+static bool conv_record_and_send(void)
+{
+    // Flush pre-speech buffer into ring buffer
+    size_t pre_len = pre_buf_drain_to_ring();
+    ESP_LOGI(TAG, "Speech detected! %zu pre-speech bytes flushed", pre_len);
+
+    s_conv_state = CONV_RECORDING;
+    xEventGroupClearBits(g_events, EVT_CONV_LISTENING);
+    xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
+
+    // Start silence timer
+    xEventGroupClearBits(s_vad_events, VAD_EVT_SILENCE);
+    xTimerReset(s_silence_timer, 0);
+    xTimerStart(s_silence_timer, 0);
+
+    // Build WS URL and connect
+    char url[384];
+    build_ws_url(url, sizeof(url));
+
+    ESP_LOGI(TAG, "Free internal heap: %lu B, WS connecting...",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    s_ws_events = xEventGroupCreate();
+    esp_websocket_client_config_t ws_cfg = { .uri = url };
+    if (strncmp(url, "wss://", 6) == 0) {
+        ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    esp_websocket_client_handle_t client = esp_websocket_client_init(&ws_cfg);
+    esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
+                                   ws_event_handler, NULL);
+    esp_websocket_client_start(client);
+
+    bool ws_connected = false;
+    bool header_sent  = false;
+    bool ws_ok        = true;
+    bool knob_exit    = false;
+    size_t total_mono = 0;
+    size_t max_mono   = RECORD_MAX_S * SAMPLE_RATE * 2;
+
+    // Stream loop: runs until silence timeout, knob press, or max duration
+    while (ws_ok && total_mono < max_mono) {
+        // Check silence timer
+        EventBits_t vad = xEventGroupGetBits(s_vad_events);
+        if (vad & VAD_EVT_SILENCE) {
+            ESP_LOGI(TAG, "Silence timeout — stopping recording");
+            break;
+        }
+
+        // Check knob press (exit conversation)
+        if (knob_btn_pressed()) {
+            knob_exit = true;
+            break;
+        }
+
+        if (!ws_connected) {
+            EventBits_t bits = xEventGroupWaitBits(s_ws_events,
+                WS_EVT_CONNECTED | WS_EVT_ERROR, pdTRUE, pdFALSE, 0);
+            if (bits & WS_EVT_ERROR) { ws_ok = false; break; }
+            if (bits & WS_EVT_CONNECTED) {
+                ws_connected = true;
+                size_t prebuf = xStreamBufferBytesAvailable(s_ring_buf);
+                ESP_LOGI(TAG, "WS connected, %zu bytes buffered (%.1f s)",
+                         prebuf, (float)prebuf / (SAMPLE_RATE * 2));
+            }
+        }
+
+        if (!ws_connected) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (!header_sent) {
+            wav_hdr_t hdr;
+            build_wav_header(&hdr, max_mono);
+            esp_websocket_client_send_bin(client, (const char *)&hdr,
+                sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
+            header_sent = true;
+        }
+
+        size_t got = xStreamBufferReceive(s_ring_buf, s_send_buf,
+                                           SEND_CHUNK, pdMS_TO_TICKS(100));
+        if (got > 0) {
+            int ret = esp_websocket_client_send_bin(client,
+                (const char *)s_send_buf, got, pdMS_TO_TICKS(5000));
+            if (ret < 0) { ws_ok = false; break; }
+            total_mono += got;
+        }
+    }
+
+    // Stop reader + I2S RX (free bus for playback)
+    xTimerStop(s_silence_timer, 0);
+    stop_listening();
+    audio_speaker_unmute();
+    xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
+
+    // If WS never connected, try waiting
+    if (!ws_connected && !knob_exit) {
+        EventBits_t bits = xEventGroupWaitBits(s_ws_events,
+            WS_EVT_CONNECTED | WS_EVT_ERROR,
+            pdTRUE, pdFALSE, pdMS_TO_TICKS(8000));
+        ws_connected = !!(bits & WS_EVT_CONNECTED);
+        if (ws_connected) {
+            size_t remaining = xStreamBufferBytesAvailable(s_ring_buf);
+            wav_hdr_t hdr;
+            build_wav_header(&hdr, remaining);
+            esp_websocket_client_send_bin(client, (const char *)&hdr,
+                sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
+        }
+    }
+
+    // Drain remaining ring buffer
+    if (ws_connected) {
+        size_t got;
+        while ((got = xStreamBufferReceive(s_ring_buf, s_send_buf, SEND_CHUNK, 0)) > 0) {
+            esp_websocket_client_send_bin(client,
+                (const char *)s_send_buf, got, pdMS_TO_TICKS(5000));
+            total_mono += got;
+        }
+    }
+
+    float dur = (float)total_mono / (SAMPLE_RATE * 2);
+    ESP_LOGI(TAG, "Conv streamed %.1f s (%zu B mono)", dur, total_mono);
+
+    if (ws_connected) {
+        esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
+    } else {
+        ESP_LOGE(TAG, "WS connect failed");
+    }
+    esp_websocket_client_destroy(client);
+    vEventGroupDelete(s_ws_events);
+
+    // If knob was pressed, signal caller to exit conversation mode
+    if (knob_exit) {
+        while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+        return false;
+    }
+
+    // Too-short recording = noise, go back to listening
+    if (total_mono < SAMPLE_RATE) {
+        ESP_LOGW(TAG, "Too short (%.1f s), likely noise", dur);
+        return false;
+    }
+
+    return true;
+}
+
+// ── Conversation mode ────────────────────────────────────────────────────────
+
+static void enter_conversation_mode(void)
+{
+    ESP_LOGI(TAG, "Entering conversation mode");
+    xEventGroupSetBits(g_events, EVT_CONV_MODE);
+
+    start_listening();
+    TickType_t listen_start = xTaskGetTickCount();
+
+    while (xEventGroupGetBits(g_events) & EVT_CONV_MODE) {
+
+        switch (s_conv_state) {
+
+        case CONV_LISTENING: {
+            // Check knob press → exit
+            if (knob_btn_pressed()) {
+                while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+                goto exit_conv;
+            }
+
+            // Check listen timeout
+            if ((xTaskGetTickCount() - listen_start) >
+                pdMS_TO_TICKS(LISTEN_TIMEOUT_S * 1000)) {
+                ESP_LOGI(TAG, "Listen timeout, exiting conversation mode");
+                goto exit_conv;
+            }
+
+            // Wait for VAD speech event
+            EventBits_t vad = xEventGroupWaitBits(s_vad_events, VAD_EVT_SPEECH,
+                pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
+            if (!(vad & VAD_EVT_SPEECH)) break;
+
+            // Speech detected → record and send
+            bool sent = conv_record_and_send();
+            if (!sent) {
+                // Noise or knob exit or error
+                if (!(xEventGroupGetBits(g_events) & EVT_CONV_MODE)) {
+                    goto exit_conv;  // knob_exit cleared EVT_CONV_MODE
+                }
+                // Restart listening after noise/error
+                start_listening();
+                listen_start = xTaskGetTickCount();
+                break;
+            }
+
+            // Recording sent successfully → wait for response
+            s_conv_state = CONV_WAITING;
+            s_wait_start = xTaskGetTickCount();
+            display_set_state(DISPLAY_STATE_WIFI_OK, "");
+            ESP_LOGI(TAG, "Waiting for server response...");
+            break;
+        }
+
+        case CONV_WAITING: {
+            // Check knob press → exit
+            if (knob_btn_pressed()) {
+                while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+                goto exit_conv;
+            }
+
+            // Check if playback started
+            EventBits_t bits = xEventGroupGetBits(g_events);
+            if (bits & EVT_AUDIO_PLAYING) {
+                s_conv_state = CONV_PLAYING;
+                ESP_LOGI(TAG, "Response playing");
+                break;
+            }
+
+            // Timeout waiting for response
+            if ((xTaskGetTickCount() - s_wait_start) >
+                pdMS_TO_TICKS(WAIT_RESPONSE_TIMEOUT_S * 1000)) {
+                ESP_LOGW(TAG, "Response timeout, resuming listening");
+                start_listening();
+                listen_start = xTaskGetTickCount();
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+            break;
+        }
+
+        case CONV_PLAYING: {
+            // Check knob press → stop playback and exit
+            if (knob_btn_pressed()) {
+                audio_stop();
+                while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+                // Wait for playback to actually stop
+                for (int i = 0; i < 20; i++) {
+                    if (!(xEventGroupGetBits(g_events) & EVT_AUDIO_PLAYING)) break;
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                goto exit_conv;
+            }
+
+            // Check if playback finished
+            EventBits_t bits = xEventGroupGetBits(g_events);
+            if (!(bits & EVT_AUDIO_PLAYING)) {
+                ESP_LOGI(TAG, "Playback done, resuming listening");
+                vTaskDelay(pdMS_TO_TICKS(200));  // brief pause
+                start_listening();
+                listen_start = xTaskGetTickCount();
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(50));
+            break;
+        }
+
+        default:
+            vTaskDelay(pdMS_TO_TICKS(50));
+            break;
+        }
+    }
+
+exit_conv:
+    // Ensure reader/I2S stopped
+    if (s_reader_running) {
+        stop_listening();
+    } else {
+        i2s_rx_stop();  // might already be stopped
+    }
+
+    // Stop any ongoing playback
+    if (xEventGroupGetBits(g_events) & EVT_AUDIO_PLAYING) {
+        audio_stop();
+    }
+
+    audio_speaker_unmute();
+    xEventGroupClearBits(g_events,
+        EVT_CONV_MODE | EVT_CONV_LISTENING | EVT_AUDIO_RECORDING);
+    xTimerStop(s_silence_timer, 0);
+    s_conv_state = CONV_OFF;
+    restore_idle_display();
+    ESP_LOGI(TAG, "Exited conversation mode");
+}
+
+// ── Record task ──────────────────────────────────────────────────────────────
 
 static void record_task(void *arg)
 {
     touch_init();
     knob_init();
 
-    // Allocate ring buffer + reader stack in PSRAM (once, reused across recordings)
+    // Allocate buffers in PSRAM (once, reused across recordings)
     s_ring_storage = heap_caps_malloc(RING_BUF_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *send_buf = heap_caps_malloc(SEND_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_send_buf     = heap_caps_malloc(SEND_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_reader_stack = heap_caps_malloc(READER_STACK_WORDS * sizeof(StackType_t),
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_ring_storage || !send_buf || !s_reader_stack) {
+    s_pre_buf      = heap_caps_malloc(PRE_SPEECH_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_ring_storage || !s_send_buf || !s_reader_stack || !s_pre_buf) {
         ESP_LOGE(TAG, "Failed to allocate buffers");
         vTaskDelete(NULL);
         return;
     }
     s_ring_buf = xStreamBufferCreateStatic(RING_BUF_BYTES, 1, s_ring_storage, &s_ring_struct);
 
-    ESP_LOGI(TAG, "Ready — %d s max, %d KB ring buffer, streaming to: %s",
-             RECORD_MAX_S, RING_BUF_BYTES / 1024, g_config.stream_recorder_url);
+    // VAD signaling
+    s_vad_events = xEventGroupCreate();
+    s_silence_timer = xTimerCreate("silence", pdMS_TO_TICKS(VAD_SILENCE_TIMEOUT_MS),
+                                    pdFALSE, NULL, silence_timer_cb);
+
+    ESP_LOGI(TAG, "Ready — conversation mode (VAD), streaming to: %s",
+             g_config.stream_recorder_url);
 
     while (1) {
-        // ── Wait for knob button press ───────────────────────────────────────
+        // Wait for knob press
         while (!knob_btn_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(30));
         }
-
-        EventBits_t bits = xEventGroupGetBits(g_events);
-        if (bits & (EVT_AUDIO_PLAYING | EVT_AUDIO_RECORDING)) {
-            while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
-            continue;
+        // Debounce: wait for release
+        while (knob_btn_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(30));
         }
+
+        // Guard: skip if already playing or no chat linked
+        EventBits_t bits = xEventGroupGetBits(g_events);
+        if (bits & EVT_AUDIO_PLAYING) continue;
         if (strlen(g_config.chat_id) == 0) {
             ESP_LOGW(TAG, "No chat linked, ignoring knob press");
-            while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
 
-        xEventGroupSetBits(g_events, EVT_AUDIO_RECORDING);
-        audio_speaker_mute();
-
-        // ── Start I2S + reader FIRST (pre-buffer while TLS handshakes) ──────
-        // Reader stack is in PSRAM → zero internal heap cost → TLS safe.
-        i2s_rx_start();
-        if (!s_mic_init) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            es7243e_init();
-            s_mic_init = true;
+        // Toggle conversation mode
+        if (bits & EVT_CONV_MODE) {
+            // Already in conversation mode — signal exit
+            xEventGroupClearBits(g_events, EVT_CONV_MODE);
+            // enter_conversation_mode() will detect this and exit
+            continue;
         }
 
-        xStreamBufferReset(s_ring_buf);
-        s_reader_running = true;
-        xTaskCreateStaticPinnedToCore(i2s_reader_task, "i2s_rd",
-            READER_STACK_WORDS, NULL, 5,
-            s_reader_stack, &s_reader_tcb, 0);
-
-        // ── Connect WebSocket (reader pre-buffers audio during TLS) ─────────
-        char url[384];
-        if (strncmp(g_config.stream_recorder_url, "https://", 8) == 0) {
-            snprintf(url, sizeof(url), "wss://%s/ws-stream?chatId=%s&auth=%s",
-                     g_config.stream_recorder_url + 8, g_config.chat_id, g_config.apikey);
-        } else if (strncmp(g_config.stream_recorder_url, "http://", 7) == 0) {
-            snprintf(url, sizeof(url), "ws://%s/ws-stream?chatId=%s&auth=%s",
-                     g_config.stream_recorder_url + 7, g_config.chat_id, g_config.apikey);
-        } else {
-            snprintf(url, sizeof(url), "ws://%s/ws-stream?chatId=%s&auth=%s",
-                     g_config.stream_recorder_url, g_config.chat_id, g_config.apikey);
-        }
-
-        ESP_LOGI(TAG, "Free internal heap: %lu B, reader on Core 0, WS connecting...",
-                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-
-        s_ws_events = xEventGroupCreate();
-        esp_websocket_client_config_t ws_cfg = { .uri = url };
-        if (strncmp(url, "wss://", 6) == 0) {
-            ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
-        }
-
-        esp_websocket_client_handle_t client = esp_websocket_client_init(&ws_cfg);
-        esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
-                                       ws_event_handler, NULL);
-        esp_websocket_client_start(client);
-
-        bool ws_connected = false;
-        bool header_sent  = false;
-        bool ws_ok        = true;
-        size_t total_mono = 0;
-        size_t max_mono   = RECORD_MAX_S * SAMPLE_RATE * 2;
-
-        // ── Main loop: wait for WS, then drain pre-buffered + live audio ────
-        // Core 0 reader fills ring buffer from I2S (including during TLS).
-        // Once WS connects, send WAV header then drain buffer + live data.
-        while (ws_ok && total_mono < max_mono && knob_btn_pressed()) {
-            if (!ws_connected) {
-                bits = xEventGroupWaitBits(s_ws_events,
-                    WS_EVT_CONNECTED | WS_EVT_ERROR, pdTRUE, pdFALSE, 0);
-                if (bits & WS_EVT_ERROR) { ws_ok = false; break; }
-                if (bits & WS_EVT_CONNECTED) {
-                    ws_connected = true;
-                    size_t prebuf = xStreamBufferBytesAvailable(s_ring_buf);
-                    ESP_LOGI(TAG, "WS connected, %zu bytes pre-buffered (%.1f s)",
-                             prebuf, (float)prebuf / (SAMPLE_RATE * 2));
-                }
-            }
-
-            if (!ws_connected) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-
-            if (!header_sent) {
-                wav_hdr_t hdr;
-                build_wav_header(&hdr, max_mono);
-                esp_websocket_client_send_bin(client, (const char *)&hdr,
-                    sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
-                header_sent = true;
-            }
-
-            size_t got = xStreamBufferReceive(s_ring_buf, send_buf,
-                                               SEND_CHUNK, pdMS_TO_TICKS(100));
-            if (got > 0) {
-                int ret = esp_websocket_client_send_bin(client,
-                    (const char *)send_buf, got, pdMS_TO_TICKS(5000));
-                if (ret < 0) { ws_ok = false; break; }
-                total_mono += got;
-            }
-        }
-
-        // ── Stop I2S reader ──────────────────────────────────────────────────
-        s_reader_running = false;
-        vTaskDelay(pdMS_TO_TICKS(300));  // wait for reader task to exit
-
-        // ── If WS never connected, try waiting (user may have released early) ─
-        if (!ws_connected) {
-            bits = xEventGroupWaitBits(s_ws_events,
-                WS_EVT_CONNECTED | WS_EVT_ERROR,
-                pdTRUE, pdFALSE, pdMS_TO_TICKS(8000));
-            ws_connected = !!(bits & WS_EVT_CONNECTED);
-            if (ws_connected) {
-                size_t remaining = xStreamBufferBytesAvailable(s_ring_buf);
-                wav_hdr_t hdr;
-                build_wav_header(&hdr, remaining);
-                esp_websocket_client_send_bin(client, (const char *)&hdr,
-                    sizeof(wav_hdr_t), pdMS_TO_TICKS(5000));
-            }
-        }
-
-        // ── Drain remaining ring buffer ──────────────────────────────────────
-        if (ws_connected) {
-            size_t got;
-            while ((got = xStreamBufferReceive(s_ring_buf, send_buf, SEND_CHUNK, 0)) > 0) {
-                esp_websocket_client_send_bin(client,
-                    (const char *)send_buf, got, pdMS_TO_TICKS(5000));
-                total_mono += got;
-            }
-        }
-
-        // ── Stop recording ───────────────────────────────────────────────────
-        i2s_rx_stop();
-        audio_speaker_unmute();
-        xEventGroupClearBits(g_events, EVT_AUDIO_RECORDING);
-
-        float dur = (float)total_mono / (SAMPLE_RATE * 2);
-        ESP_LOGI(TAG, "Streamed %.1f s (%zu B mono)", dur, total_mono);
-
-        if (ws_connected) {
-            esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
-        } else {
-            ESP_LOGE(TAG, "WS connect failed");
-        }
-
-        esp_websocket_client_destroy(client);
-        vEventGroupDelete(s_ws_events);
-
-        if (total_mono < SAMPLE_RATE) {
-            ESP_LOGW(TAG, "Too short (%.1f s), discarded by server", dur);
-        }
-
-        restore_idle_display();
-        while (knob_btn_pressed()) vTaskDelay(pdMS_TO_TICKS(30));
+        enter_conversation_mode();
     }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+static StaticTask_t s_record_tcb;
+
 void record_init(void)
 {
-    xTaskCreatePinnedToCore(record_task, "record", 8192, NULL, 4, NULL, 1);
+    StackType_t *stack = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(stack);
+    xTaskCreateStaticPinnedToCore(record_task, "record",
+        8192 / sizeof(StackType_t), NULL, 4, stack, &s_record_tcb, 1);
     ESP_LOGI(TAG, "Record task spawned");
 }

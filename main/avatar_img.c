@@ -200,7 +200,14 @@ done:
     vTaskDelete(NULL);
 }
 
+// Use PSRAM stack to keep internal SRAM free for TLS operations
+static StaticTask_t s_avatar_tcb;
+
 void avatar_img_start(void)
 {
-    xTaskCreate(avatar_task, "avatar_dl", 8192, NULL, 3, NULL);
+    StackType_t *stack = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (stack) {
+        xTaskCreateStaticPinnedToCore(avatar_task, "avatar_dl",
+            8192 / sizeof(StackType_t), NULL, 3, stack, &s_avatar_tcb, 1);
+    }
 }
