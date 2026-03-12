@@ -1,6 +1,7 @@
 #include "led.h"
 #include "board.h"
 #include "events.h"
+#include "power.h"
 #include "record.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -42,7 +43,25 @@ void led_task_fn(void *pvParameter)
 
     bool led_on = false;
     bool blink_phase = false;
+    uint32_t sleep_flash_counter = 0;
     while (1) {
+        // Display-off mode: brief white flash every 5 seconds
+        if (power_display_is_off()) {
+            sleep_flash_counter++;
+            // 5000ms / 50ms tick = 100 ticks
+            if (sleep_flash_counter >= 100) {
+                sleep_flash_counter = 0;
+                led_strip_set_pixel(strip, 0, 15, 15, 15);
+                led_strip_refresh(strip);
+                vTaskDelay(pdMS_TO_TICKS(80));
+                led_strip_clear(strip);
+                led_strip_refresh(strip);
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        sleep_flash_counter = 0;
+
         EventBits_t bits = xEventGroupGetBits(g_events);
         bool connected      = (bits & EVT_WIFI_GOT_IP) != 0;
         bool recording      = (bits & EVT_AUDIO_RECORDING) != 0;

@@ -84,9 +84,8 @@ void app_main(void)
     // Power management (deep sleep on inactivity)
     xTaskCreate(power_task_fn, "power", 2048, NULL, 1, NULL);
 
-    // Main loop — heartbeat
+    // Main loop — keep task alive
     while (1) {
-        power_reset_sleep_timer();
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }

@@ -525,6 +525,18 @@ void display_set_scenario(uint16_t *rgb565, int w, int h)
     display_lvgl_unlock();
 }
 
+void display_sleep(void)
+{
+    backlight_set(0);
+    ESP_LOGI(TAG, "Display sleep (backlight off)");
+}
+
+void display_wake(void)
+{
+    backlight_set(100);
+    ESP_LOGI(TAG, "Display wake (backlight on)");
+}
+
 void display_set_avatar(uint16_t *rgb565, int w, int h)
 {
     if (!rgb565 || w <= 0 || h <= 0) return;
