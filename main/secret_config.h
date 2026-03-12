@@ -32,3 +32,7 @@
 #ifndef SECRET_STREAM_RECORDER_URL
 #define SECRET_STREAM_RECORDER_URL "https://stream-recorder.cipherdolls.com"
 #endif
+
+#ifndef SECRET_STREAM_PLAYER_URL
+#define SECRET_STREAM_PLAYER_URL "https://stream-player.cipherdolls.com"
+#endif

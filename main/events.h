@@ -16,5 +16,7 @@
 #define EVT_CONV_MODE           (1 << 10)  // conversation mode active
 #define EVT_CONV_LISTENING      (1 << 11)  // listening for speech (green LED)
 #define EVT_IMAGES_DONE         (1 << 12)  // avatar+scenario download finished
+#define EVT_STREAM_PLAYING      (1 << 13)  // stream-player delivering TTS audio
+#define EVT_STREAM_CONNECTED    (1 << 14)  // stream-player WebSocket connected
 
 extern EventGroupHandle_t g_events;

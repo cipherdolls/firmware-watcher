@@ -63,7 +63,7 @@ static uint8_t             *s_ring_storage;
 static volatile bool        s_reader_running;
 
 // Reader task stack in PSRAM (keeps internal heap free for TLS)
-#define READER_STACK_WORDS 2048   // 2048 words = 8 KB stack
+#define READER_STACK_WORDS 4096   // 4096 words = 16 KB stack
 static StackType_t         *s_reader_stack;
 static StaticTask_t         s_reader_tcb;
 
@@ -258,7 +258,9 @@ static void i2s_rx_stop(void)
 
 // ── WebSocket event helpers ──────────────────────────────────────────────────
 
-static EventGroupHandle_t s_ws_events;
+static EventGroupHandle_t              s_ws_events       = NULL;
+static esp_websocket_client_handle_t   s_preconnect_client = NULL;
+
 #define WS_EVT_CONNECTED   (1 << 0)
 #define WS_EVT_CLOSED      (1 << 1)
 #define WS_EVT_ERROR       (1 << 2)
@@ -418,6 +420,47 @@ static void build_ws_url(char *url, size_t url_size)
     }
 }
 
+// ── WebSocket pre-connect helpers ────────────────────────────────────────────
+
+static void ws_preconnect_start(void)
+{
+    if (s_preconnect_client) return;  // already connecting
+
+    if (s_ws_events) {
+        vEventGroupDelete(s_ws_events);
+    }
+    s_ws_events = xEventGroupCreate();
+
+    char url[384];
+    build_ws_url(url, sizeof(url));
+
+    esp_websocket_client_config_t ws_cfg = {
+        .uri        = url,
+        .task_stack = 8192,
+    };
+    if (strncmp(url, "wss://", 6) == 0) {
+        ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    s_preconnect_client = esp_websocket_client_init(&ws_cfg);
+    esp_websocket_register_events(s_preconnect_client, WEBSOCKET_EVENT_ANY,
+                                   ws_event_handler, NULL);
+    esp_websocket_client_start(s_preconnect_client);
+    ESP_LOGI(TAG, "WebSocket pre-connecting...");
+}
+
+static void ws_preconnect_cancel(void)
+{
+    if (!s_preconnect_client) return;
+    esp_websocket_client_stop(s_preconnect_client);
+    esp_websocket_client_destroy(s_preconnect_client);
+    s_preconnect_client = NULL;
+    if (s_ws_events) {
+        vEventGroupDelete(s_ws_events);
+        s_ws_events = NULL;
+    }
+}
+
 // ── Start listening (I2S RX + reader task) ───────────────────────────────────
 
 static void start_listening(void)
@@ -475,23 +518,33 @@ static bool conv_record_and_send(void)
     xTimerReset(s_silence_timer, 0);
     xTimerStart(s_silence_timer, 0);
 
-    // Build WS URL and connect
-    char url[384];
-    build_ws_url(url, sizeof(url));
-
-    ESP_LOGI(TAG, "Free internal heap: %lu B, WS connecting...",
+    ESP_LOGI(TAG, "Free internal heap: %lu B",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-    s_ws_events = xEventGroupCreate();
-    esp_websocket_client_config_t ws_cfg = { .uri = url };
-    if (strncmp(url, "wss://", 6) == 0) {
-        ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    // Use pre-connected WebSocket if available, otherwise connect now
+    esp_websocket_client_handle_t client;
+    if (s_preconnect_client) {
+        client = s_preconnect_client;
+        s_preconnect_client = NULL;
+        ESP_LOGI(TAG, "Using pre-connected WebSocket");
+    } else {
+        char url[384];
+        build_ws_url(url, sizeof(url));
+        if (s_ws_events) vEventGroupDelete(s_ws_events);
+        s_ws_events = xEventGroupCreate();
+        esp_websocket_client_config_t ws_cfg = {
+            .uri        = url,
+            .task_stack = 8192,
+        };
+        if (strncmp(url, "wss://", 6) == 0) {
+            ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+        }
+        client = esp_websocket_client_init(&ws_cfg);
+        esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
+                                       ws_event_handler, NULL);
+        esp_websocket_client_start(client);
+        ESP_LOGI(TAG, "WebSocket connecting now (no pre-connect available)");
     }
-
-    esp_websocket_client_handle_t client = esp_websocket_client_init(&ws_cfg);
-    esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY,
-                                   ws_event_handler, NULL);
-    esp_websocket_client_start(client);
 
     bool ws_connected = false;
     bool header_sent  = false;
@@ -584,13 +637,13 @@ static bool conv_record_and_send(void)
     float dur = (float)total_mono / (SAMPLE_RATE * 2);
     ESP_LOGI(TAG, "Conv streamed %.1f s (%zu B mono)", dur, total_mono);
 
-    if (ws_connected) {
-        esp_websocket_client_close(client, pdMS_TO_TICKS(5000));
-    } else {
+    if (!ws_connected) {
         ESP_LOGE(TAG, "WS connect failed");
     }
+    esp_websocket_client_stop(client);
     esp_websocket_client_destroy(client);
     vEventGroupDelete(s_ws_events);
+    s_ws_events = NULL;
 
     // If knob was pressed, signal caller to exit conversation mode
     if (knob_exit) {
@@ -615,6 +668,7 @@ static void enter_conversation_mode(void)
     xEventGroupSetBits(g_events, EVT_CONV_MODE);
 
     start_listening();
+    ws_preconnect_start();  // begin WS handshake while waiting for speech onset
     TickType_t listen_start = xTaskGetTickCount();
 
     while (xEventGroupGetBits(g_events) & EVT_CONV_MODE) {
@@ -649,6 +703,7 @@ static void enter_conversation_mode(void)
                 }
                 // Restart listening after noise/error
                 start_listening();
+                ws_preconnect_start();
                 listen_start = xTaskGetTickCount();
                 break;
             }
@@ -656,6 +711,7 @@ static void enter_conversation_mode(void)
             // Recording sent successfully → wait for response
             s_conv_state = CONV_WAITING;
             s_wait_start = xTaskGetTickCount();
+            ws_preconnect_start();  // pre-connect for next recording round
             display_set_state(DISPLAY_STATE_WIFI_OK, "");
             ESP_LOGI(TAG, "Waiting for server response...");
             break;
@@ -707,6 +763,7 @@ static void enter_conversation_mode(void)
                 ESP_LOGI(TAG, "Playback done, resuming listening");
                 vTaskDelay(pdMS_TO_TICKS(200));  // brief pause
                 start_listening();
+                ws_preconnect_start();
                 listen_start = xTaskGetTickCount();
             }
 
@@ -721,6 +778,8 @@ static void enter_conversation_mode(void)
     }
 
 exit_conv:
+    ws_preconnect_cancel();  // discard any pending pre-connect
+
     // Ensure reader/I2S stopped
     if (s_reader_running) {
         stop_listening();
@@ -733,7 +792,7 @@ exit_conv:
         audio_stop();
     }
 
-    audio_speaker_unmute();
+    audio_speaker_mute();
     xEventGroupClearBits(g_events,
         EVT_CONV_MODE | EVT_CONV_LISTENING | EVT_AUDIO_RECORDING);
     xTimerStop(s_silence_timer, 0);

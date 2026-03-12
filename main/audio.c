@@ -13,11 +13,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include <string.h>
 #include <stdio.h>
 
-#define ES8311_ADDR     0x18   // ADDR pin low on SenseCAP Watcher
-#define ES8311_MCLK_HZ  (16 * 44100)  // 16× MCLK ratio
+#define ES8311_ADDR         0x18  // ADDR pin low on SenseCAP Watcher
+#define I2S_MCLK_MULTIPLE   256   // matches I2S_STD_CLK_DEFAULT_CONFIG
 
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_ONLY_MP3
@@ -25,9 +27,10 @@
 
 static const char *TAG = "audio";
 
-static i2s_chan_handle_t  s_tx_chan = NULL;
-static QueueHandle_t      s_queue  = NULL;
-static volatile bool      s_stop   = false;
+static i2s_chan_handle_t   s_tx_chan    = NULL;
+static QueueHandle_t      s_queue     = NULL;
+static SemaphoreHandle_t  s_play_mutex = NULL;
+static volatile bool      s_stop      = false;
 
 // PSRAM-allocated decode buffers — keeps internal SRAM free for TLS/WiFi/LVGL heap
 static mp3dec_t  *s_dec    = NULL;
@@ -64,7 +67,7 @@ static void codec_init(int sample_rate)
         .sample_frequency   = sample_rate,
     };
     ESP_ERROR_CHECK(es8311_init(s_codec, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16));
-    ESP_ERROR_CHECK(es8311_sample_frequency_config(s_codec, ES8311_MCLK_HZ, sample_rate));
+    ESP_ERROR_CHECK(es8311_sample_frequency_config(s_codec, I2S_MCLK_MULTIPLE * sample_rate, sample_rate));
     ESP_ERROR_CHECK(es8311_voice_volume_set(s_codec, 70, NULL));
     ESP_ERROR_CHECK(es8311_microphone_config(s_codec, false));
     ESP_LOGI(TAG, "ES8311 initialized at %d Hz, volume 70", sample_rate);
@@ -98,7 +101,8 @@ static void i2s_start(int sample_rate)
 
     // Configure codec sample rate now that MCLK is running from I2S
     if (s_codec) {
-        ESP_ERROR_CHECK(es8311_sample_frequency_config(s_codec, ES8311_MCLK_HZ, sample_rate));
+        ESP_ERROR_CHECK(es8311_sample_frequency_config(s_codec, I2S_MCLK_MULTIPLE * sample_rate, sample_rate));
+        es8311_voice_mute(s_codec, false);
         ESP_ERROR_CHECK(es8311_voice_volume_set(s_codec, 70, NULL));
     } else {
         codec_init(sample_rate);
@@ -122,9 +126,18 @@ static void i2s_stop_ch(void)
 
 static void stream_play_mp3(const char *message_id)
 {
+    if (xSemaphoreTake(s_play_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Audio busy, skipping HTTP play for %s", message_id);
+        return;
+    }
+
     uint8_t *sbuf = heap_caps_malloc(STREAM_BUF_SIZE,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!sbuf) { ESP_LOGE(TAG, "No memory for stream buffer"); return; }
+    if (!sbuf) {
+        ESP_LOGE(TAG, "No memory for stream buffer");
+        xSemaphoreGive(s_play_mutex);
+        return;
+    }
 
     char url[256], auth[128];
     snprintf(url,  sizeof(url),  "%s/messages/%s/audio",
@@ -220,7 +233,11 @@ static void stream_play_mp3(const char *message_id)
     }
 
     if (i2s_started) {
-        vTaskDelay(pdMS_TO_TICKS(150));  // let DMA drain
+        // Flush DMA with silence to prevent echo/artifact at end
+        memset(s_pcm, 0, MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
+        size_t zw = 0;
+        i2s_channel_write(s_tx_chan, s_pcm, MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t), &zw, pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(50));
         i2s_stop_ch();
     }
 
@@ -234,6 +251,7 @@ cleanup:
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     free(sbuf);
+    xSemaphoreGive(s_play_mutex);
 }
 
 // ── Play task ─────────────────────────────────────────────────────────────────
@@ -266,6 +284,7 @@ void audio_init(void)
         32768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(audio_stack);
 
+    s_play_mutex = xSemaphoreCreateMutex();
     s_queue = xQueueCreate(4, sizeof(play_req_t));
     xTaskCreateStaticPinnedToCore(audio_play_task, "audio_play",
         32768 / sizeof(StackType_t), NULL, 5, audio_stack, &s_audio_tcb, 0);
@@ -329,4 +348,117 @@ void audio_speaker_unmute(void)
         es8311_voice_mute(s_codec, false);
         es8311_voice_volume_set(s_codec, 70, NULL);
     }
+}
+
+// ── Stream-fed playback (from stream_player WebSocket) ──────────────────────
+
+void audio_stream_play(StreamBufferHandle_t stream,
+                       volatile bool *stream_active,
+                       volatile bool *stream_error,
+                       uint8_t first_byte)
+{
+    if (xSemaphoreTake(s_play_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Audio busy, skipping stream play");
+        return;
+    }
+
+    uint8_t *sbuf = heap_caps_malloc(STREAM_BUF_SIZE,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!sbuf) {
+        ESP_LOGE(TAG, "No memory for stream buffer");
+        xSemaphoreGive(s_play_mutex);
+        return;
+    }
+
+    bool i2s_started = false;
+    mp3dec_init(s_dec);
+    s_stop = false;
+    xEventGroupSetBits(g_events, EVT_AUDIO_PLAYING);
+    display_set_state(DISPLAY_STATE_PLAYING, "Playing...");
+
+    // Seed buffer with the first peeked byte
+    sbuf[0] = first_byte;
+    size_t buf_fill = 1;
+
+    while (!s_stop) {
+        // Fill buffer from StreamBuffer
+        // Don't block when stream has ended — avoids I2S DMA replaying stale audio
+        if (buf_fill < STREAM_BUF_SIZE) {
+            TickType_t wait = *stream_active ? pdMS_TO_TICKS(200) : 0;
+            size_t rd = xStreamBufferReceive(stream,
+                            sbuf + buf_fill,
+                            STREAM_BUF_SIZE - buf_fill,
+                            wait);
+            buf_fill += rd;
+        }
+
+        // Check for error with empty buffer
+        if (*stream_error && buf_fill == 0) {
+            ESP_LOGW(TAG, "Stream error, aborting playback");
+            break;
+        }
+
+        if (buf_fill == 0) {
+            if (!(*stream_active) && xStreamBufferBytesAvailable(stream) == 0)
+                break;  // stream ended, no more data
+            continue;    // wait for more data
+        }
+
+        // Decode one MP3 frame
+        mp3dec_frame_info_t info = {};
+        int samples = mp3dec_decode_frame(s_dec, sbuf, (int)buf_fill,
+                                           s_pcm, &info);
+
+        if (info.frame_bytes == 0) {
+            // Need more data
+            if (!(*stream_active) && xStreamBufferBytesAvailable(stream) == 0)
+                break;
+            continue;
+        }
+
+        buf_fill -= info.frame_bytes;
+        if (buf_fill > 0)
+            memmove(sbuf, sbuf + info.frame_bytes, buf_fill);
+
+        if (samples <= 0) continue;  // ID3 / padding frame
+
+        // Init I2S once we know the sample rate
+        if (!i2s_started) {
+            i2s_start(info.hz);
+            i2s_started = true;
+        }
+
+        // Play decoded PCM
+        int16_t *out   = s_pcm;
+        size_t   bytes = (size_t)samples * info.channels * sizeof(int16_t);
+
+        if (info.channels == 1) {
+            for (int i = 0; i < samples; i++) {
+                s_stereo[i * 2]     = s_pcm[i];
+                s_stereo[i * 2 + 1] = s_pcm[i];
+            }
+            out   = s_stereo;
+            bytes = (size_t)samples * 2 * sizeof(int16_t);
+        }
+
+        size_t written = 0;
+        i2s_channel_write(s_tx_chan, out, bytes, &written, pdMS_TO_TICKS(2000));
+    }
+
+    if (i2s_started) {
+        // Flush DMA with silence to prevent echo/artifact at end
+        memset(s_pcm, 0, MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
+        size_t zw = 0;
+        i2s_channel_write(s_tx_chan, s_pcm, MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t), &zw, pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(50));
+        i2s_stop_ch();
+    }
+
+    xEventGroupClearBits(g_events, EVT_AUDIO_PLAYING);
+
+    const char *msg = strlen(g_config.chat_id) > 0 ? "" : "No chat linked";
+    display_set_state(DISPLAY_STATE_WIFI_OK, msg);
+
+    free(sbuf);
+    xSemaphoreGive(s_play_mutex);
 }

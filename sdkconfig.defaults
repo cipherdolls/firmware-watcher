@@ -41,6 +41,19 @@ CONFIG_LV_MEMCPY_MEMSET_STD=y
 # (WiFi + I2S + SPI LCD + I2C touch + I2C audio + LEDC + RMT use all slots)
 CONFIG_MBEDTLS_HARDWARE_MPI=n
 
+# TLS — external (PSRAM) allocation so concurrent TLS connections can coexist
+# (stream-player + stream-recorder WebSockets both need TLS simultaneously;
+# each TLS context uses ~15 KB — too much for the ~64 KB internal SRAM budget)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+# Software AES — hardware AES needs DMA-capable (internal) memory which is scarce
+CONFIG_MBEDTLS_HARDWARE_AES=n
+
 # Allow FreeRTOS task stacks to be placed in PSRAM
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 

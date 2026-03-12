@@ -46,17 +46,40 @@ static void handle_action_event(const char *data, int data_len)
 
     if (type && action) {
         if (strcmp(type, "audio") == 0) {
-            if (strcmp(action, "play") == 0 || strcmp(action, "replay") == 0) {
+            if (strcmp(action, "play") == 0) {
                 const char *mid = cJSON_GetStringValue(cJSON_GetObjectItem(json, "messageId"));
                 if (mid) {
-                    if (xEventGroupGetBits(g_events) & EVT_AUDIO_RECORDING) {
+                    EventBits_t bits = xEventGroupGetBits(g_events);
+                    if (bits & EVT_AUDIO_RECORDING) {
                         ESP_LOGW(TAG, "Recording in progress, skipping play %.36s", mid);
+                    } else if (bits & (EVT_STREAM_PLAYING | EVT_AUDIO_PLAYING)) {
+                        ESP_LOGI(TAG, "Already playing, skipping %.36s", mid);
+                    } else if (bits & EVT_STREAM_CONNECTED) {
+                        // Give stream-player 2 s to receive tts_start
+                        ESP_LOGI(TAG, "Waiting for stream-player %.36s", mid);
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                        bits = xEventGroupGetBits(g_events);
+                        if (bits & (EVT_STREAM_PLAYING | EVT_AUDIO_PLAYING)) {
+                            ESP_LOGI(TAG, "Stream-player delivering %.36s", mid);
+                        } else {
+                            ESP_LOGI(TAG, "Stream-player idle, HTTP fallback: %.36s", mid);
+                            audio_play_message(mid);
+                        }
                     } else {
-                        ESP_LOGI(TAG, "Audio message arrived: %.36s", mid);
+                        ESP_LOGI(TAG, "Audio play (HTTP): %.36s", mid);
                         audio_play_message(mid);
                     }
-                } else {
-                    ESP_LOGW(TAG, "audio play missing messageId");
+                }
+            } else if (strcmp(action, "replay") == 0) {
+                const char *mid = cJSON_GetStringValue(cJSON_GetObjectItem(json, "messageId"));
+                if (mid) {
+                    EventBits_t bits = xEventGroupGetBits(g_events);
+                    if (bits & (EVT_AUDIO_RECORDING | EVT_AUDIO_PLAYING)) {
+                        ESP_LOGW(TAG, "Busy, skipping replay %.36s", mid);
+                    } else {
+                        ESP_LOGI(TAG, "Audio replay (HTTP): %.36s", mid);
+                        audio_play_message(mid);
+                    }
                 }
             } else if (strcmp(action, "stop") == 0) {
                 audio_stop();
