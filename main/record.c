@@ -766,6 +766,7 @@ static void enter_conversation_mode(void)
             EventBits_t bits = xEventGroupGetBits(g_events);
             if (!(bits & EVT_AUDIO_PLAYING)) {
                 ESP_LOGI(TAG, "Playback done, resuming listening");
+                xEventGroupSetBits(g_events, EVT_CONV_LISTENING);  // immediately show red, not white
                 vTaskDelay(pdMS_TO_TICKS(200));  // brief pause
                 start_listening();
                 ws_preconnect_start();
