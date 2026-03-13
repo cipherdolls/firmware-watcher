@@ -10,6 +10,7 @@
 #include "freertos/event_groups.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -262,8 +263,10 @@ static void handle_serial_line(const char *line)
         if (strlen(key) > 0) {
             strlcpy(g_config.apikey, key, sizeof(g_config.apikey));
             config_store_save();
-            ESP_LOGI(TAG, "API key set via serial");
+            ESP_LOGI(TAG, "API key set via serial, rebooting...");
             uart_write_bytes(UART_NUM, "OK:APIKEY\n", 10);
+            uart_wait_tx_done(UART_NUM, pdMS_TO_TICKS(500));
+            esp_restart();
         } else {
             uart_write_bytes(UART_NUM, "ERR:APIKEY_EMPTY\n", 17);
         }
