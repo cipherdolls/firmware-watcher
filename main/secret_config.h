@@ -17,9 +17,7 @@
 #define SECRET_APIKEY     "your_api_key"
 #endif
 
-#ifndef SECRET_DOLL_BODY_ID
-#define SECRET_DOLL_BODY_ID    "your_doll_body_id"
-#endif
+#define SECRET_DOLL_BODY_ID    "b37e3f13-ab0a-4373-a6fa-eb9dc5ef1586"
 
 #ifndef SECRET_SERVER_URL
 #define SECRET_SERVER_URL "https://api.cipherdolls.com"

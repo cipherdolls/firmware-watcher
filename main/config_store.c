@@ -51,7 +51,6 @@ esp_err_t config_store_load(void)
     if (nvs_get_str(h, "apikey", buf, &len) == ESP_OK && strlen(buf) > 0) {
         strlcpy(g_config.apikey, buf, sizeof(g_config.apikey));
     }
-
     uint8_t vol;
     if (nvs_get_u8(h, "volume", &vol) == ESP_OK) {
         g_config.speaker_volume = vol;
