@@ -132,6 +132,7 @@ static void sync_task(void *arg)
     char mac[18];
     get_mac_str(mac, sizeof(mac));
     snprintf(auth, sizeof(auth), "Bearer %s", g_config.apikey);
+    ESP_LOGI(TAG, "API key: '%.8s...' (len=%d)", g_config.apikey, (int)strlen(g_config.apikey));
 
     // GET /dolls and POST /dolls both accept Bearer auth.
     // 401 on either means the API key is wrong — surface that immediately.
