@@ -13,9 +13,7 @@
 static uint8_t rms_to_brightness(uint16_t rms, uint8_t min_br, uint8_t max_br)
 {
     if (rms == 0) return min_br;
-    // clamp to expected speech range
     if (rms > 2000) rms = 2000;
-    // sqrt curve: maps 0–2000 → 0–1.0
     float norm = __builtin_sqrtf((float)rms / 2000.0f);
     uint8_t br = (uint8_t)(min_br + norm * (max_br - min_br));
     return br;
@@ -42,56 +40,51 @@ void led_task_fn(void *pvParameter)
     }
 
     bool led_on = false;
-    bool blink_phase = false;
-    uint32_t sleep_flash_counter = 0;
+    uint32_t standby_counter = 0;
     while (1) {
-        // Display-off mode: brief white flash every 5 seconds
+        EventBits_t bits = xEventGroupGetBits(g_events);
+        bool recording      = (bits & EVT_AUDIO_RECORDING) != 0;
+        bool playing        = (bits & EVT_AUDIO_PLAYING) != 0;
+        bool conv_listening = (bits & EVT_CONV_LISTENING) != 0;
+        bool conv_mode      = (bits & EVT_CONV_MODE) != 0;
+
+        // ── Standby mode: display off → white blink every 5 s ───────
         if (power_display_is_off()) {
-            sleep_flash_counter++;
-            // 5000ms / 50ms tick = 100 ticks
-            if (sleep_flash_counter >= 100) {
-                sleep_flash_counter = 0;
+            standby_counter++;
+            if (standby_counter >= 100) {  // 100 × 50 ms = 5 s
+                standby_counter = 0;
                 led_strip_set_pixel(strip, 0, 15, 15, 15);
                 led_strip_refresh(strip);
                 vTaskDelay(pdMS_TO_TICKS(80));
                 led_strip_clear(strip);
                 led_strip_refresh(strip);
             }
+            if (led_on) {
+                led_strip_clear(strip);
+                led_strip_refresh(strip);
+                led_on = false;
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        sleep_flash_counter = 0;
+        standby_counter = 0;
 
-        EventBits_t bits = xEventGroupGetBits(g_events);
-        bool connected      = (bits & EVT_WIFI_GOT_IP) != 0;
-        bool recording      = (bits & EVT_AUDIO_RECORDING) != 0;
-        bool playing        = (bits & EVT_AUDIO_PLAYING) != 0;
-        bool conv_listening = (bits & EVT_CONV_LISTENING) != 0;
-        bool conv_mode      = (bits & EVT_CONV_MODE) != 0;
-
-        if (!connected) {
-            // Blink orange when not connected to WiFi
-            led_on = !led_on;
-            if (led_on) {
-                led_strip_set_pixel(strip, 0, 20, 8, 0);
-            } else {
-                led_strip_clear(strip);
-            }
-            led_strip_refresh(strip);
-        } else if (recording) {
-            // Red pulsing with voice volume — min 8, max 30
+        // ── Talking mode: recording / playing / listening ───────────
+        if (recording) {
+            // Red pulsing with voice volume
             uint8_t br = rms_to_brightness(g_audio_rms, 8, 30);
             led_strip_set_pixel(strip, 0, br, 0, 0);
             led_strip_refresh(strip);
             led_on = true;
         } else if (playing) {
-            // Blue pulsing with playback volume — min 8, max 30
+            // Blue pulsing with playback volume
             uint8_t br = rms_to_brightness(g_audio_rms, 8, 30);
             led_strip_set_pixel(strip, 0, 0, 0, br);
             led_strip_refresh(strip);
             led_on = true;
         } else if (conv_mode && !conv_listening) {
             // Blink white — waiting for server response
+            static bool blink_phase = false;
             blink_phase = !blink_phase;
             if (blink_phase) {
                 led_strip_set_pixel(strip, 0, 4, 4, 4);
@@ -101,19 +94,19 @@ void led_task_fn(void *pvParameter)
             led_strip_refresh(strip);
             led_on = true;
         } else if (conv_listening) {
-            // Dim red pulsing with ambient level — min 3, max 12
+            // Dim red pulsing with ambient level
             uint8_t br = rms_to_brightness(g_audio_rms, 3, 12);
             led_strip_set_pixel(strip, 0, br, 0, 0);
             led_strip_refresh(strip);
             led_on = true;
         } else {
-            // Off — disabled / idle
+            // ── Ready mode: LED off ─────────────────────────────────
             if (led_on) {
                 led_strip_clear(strip);
                 led_strip_refresh(strip);
                 led_on = false;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(50));  // 50 ms for responsive metering
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }

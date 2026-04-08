@@ -33,10 +33,15 @@ static lv_obj_t *s_label = NULL;
 // Battery indicator (top of screen)
 static lv_obj_t *s_batt_label = NULL;
 
-// Bottom status panel: WiFi + MQTT in 2x2 grid
-static lv_obj_t *s_wifi_icon  = NULL;   // WiFi signal icon (top-left)
-static lv_obj_t *s_wifi_label = NULL;   // "WiFi" text (top-right)
-static lv_obj_t *s_mqtt_label = NULL;   // "MQTT" text (bottom-right)
+// WiFi indicator (top, below battery)
+static lv_obj_t *s_wifi_icon  = NULL;
+static lv_obj_t *s_wifi_label = NULL;
+
+// Bottom status panel: MQTT + WS
+static lv_obj_t *s_mqtt_label = NULL;
+static lv_obj_t *s_ws_label   = NULL;
+static lv_obj_t *s_ws_dot_player   = NULL;  // stream-player dot
+static lv_obj_t *s_ws_dot_recorder = NULL;  // stream-recorder dot
 
 // Scenario image (full-screen background)
 static lv_obj_t *s_scenario_img = NULL;
@@ -339,41 +344,45 @@ void display_set_state(display_state_t state, const char *text)
     display_lvgl_unlock();
 }
 
-// ── Bottom status panel helpers ───────────────────────────────────────────────
+// ── WiFi indicator (top, below battery) ──────────────────────────────────────
 
-// Anchor positions for the 2x2 grid in the bottom arc area
-#define STATUS_LEFT_X   175       // left column X (icons/dots)
+static void ensure_wifi_top(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+
+    if (!s_wifi_icon) {
+        s_wifi_icon = lv_label_create(scr);
+        lv_obj_align(s_wifi_icon, LV_ALIGN_TOP_MID, -20, 28);
+        lv_obj_set_style_text_color(s_wifi_icon, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_wifi_icon, LV_SYMBOL_WIFI);
+    }
+
+    if (!s_wifi_label) {
+        s_wifi_label = lv_label_create(scr);
+        lv_obj_align(s_wifi_label, LV_ALIGN_TOP_MID, 10, 28);
+        lv_obj_set_style_text_color(s_wifi_label, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_wifi_label, "WiFi");
+    }
+}
+
+// ── Bottom status panel: MQTT + WS ──────────────────────────────────────────
+
+#define STATUS_LEFT_X   175       // left column X (dots)
 #define STATUS_RIGHT_X  215       // right column X (text)
-#define STATUS_ROW1_Y   (-38)     // top row Y offset from bottom
-#define STATUS_ROW2_Y   (-20)     // bottom row Y offset from bottom
+#define STATUS_ROW1_Y   (-38)     // MQTT row Y offset from bottom
+#define STATUS_ROW2_Y   (-20)     // WS row Y offset from bottom
 
 static void ensure_bottom_panel(void)
 {
     lv_obj_t *scr = lv_scr_act();
 
-    // Row 1 left: WiFi icon
-    if (!s_wifi_icon) {
-        s_wifi_icon = lv_label_create(scr);
-        lv_obj_set_pos(s_wifi_icon, STATUS_LEFT_X, LCD_V_RES + STATUS_ROW1_Y);
-        lv_obj_set_style_text_color(s_wifi_icon, lv_color_make(0x66, 0x66, 0x66), 0);
-        lv_label_set_text(s_wifi_icon, LV_SYMBOL_WIFI);
-    }
-
-    // Row 1 right: "WiFi" text
-    if (!s_wifi_label) {
-        s_wifi_label = lv_label_create(scr);
-        lv_obj_set_pos(s_wifi_label, STATUS_RIGHT_X, LCD_V_RES + STATUS_ROW1_Y);
-        lv_obj_set_style_text_color(s_wifi_label, lv_color_make(0x66, 0x66, 0x66), 0);
-        lv_label_set_text(s_wifi_label, "WiFi");
-    }
-
-    // Row 2 left: TX + RX dots
+    // Row 1: MQTT — TX + RX dots + "MQTT" text
     if (!s_dot_tx) {
         s_dot_tx = make_dot(scr);
-        lv_obj_set_pos(s_dot_tx, STATUS_LEFT_X, LCD_V_RES + STATUS_ROW2_Y);
+        lv_obj_set_pos(s_dot_tx, STATUS_LEFT_X, LCD_V_RES + STATUS_ROW1_Y);
 
         s_dot_rx = make_dot(scr);
-        lv_obj_set_pos(s_dot_rx, STATUS_LEFT_X + DOT_SIZE + 4, LCD_V_RES + STATUS_ROW2_Y);
+        lv_obj_set_pos(s_dot_rx, STATUS_LEFT_X + DOT_SIZE + 4, LCD_V_RES + STATUS_ROW1_Y);
 
         esp_timer_create_args_t ta = { .callback = dim_tx_cb, .name = "dot_tx" };
         esp_timer_create(&ta, &s_dim_timer_tx);
@@ -381,19 +390,34 @@ static void ensure_bottom_panel(void)
         esp_timer_create(&rb, &s_dim_timer_rx);
     }
 
-    // Row 2 right: "MQTT" text
     if (!s_mqtt_label) {
         s_mqtt_label = lv_label_create(scr);
-        lv_obj_set_pos(s_mqtt_label, STATUS_RIGHT_X, LCD_V_RES + STATUS_ROW2_Y);
+        lv_obj_set_pos(s_mqtt_label, STATUS_RIGHT_X, LCD_V_RES + STATUS_ROW1_Y);
         lv_obj_set_style_text_color(s_mqtt_label, lv_color_make(0x66, 0x66, 0x66), 0);
         lv_label_set_text(s_mqtt_label, "MQTT");
+    }
+
+    // Row 2: WS — player dot + recorder dot + "WS" text
+    if (!s_ws_dot_player) {
+        s_ws_dot_player = make_dot(scr);
+        lv_obj_set_pos(s_ws_dot_player, STATUS_LEFT_X, LCD_V_RES + STATUS_ROW2_Y);
+
+        s_ws_dot_recorder = make_dot(scr);
+        lv_obj_set_pos(s_ws_dot_recorder, STATUS_LEFT_X + DOT_SIZE + 4, LCD_V_RES + STATUS_ROW2_Y);
+    }
+
+    if (!s_ws_label) {
+        s_ws_label = lv_label_create(scr);
+        lv_obj_set_pos(s_ws_label, STATUS_RIGHT_X, LCD_V_RES + STATUS_ROW2_Y);
+        lv_obj_set_style_text_color(s_ws_label, lv_color_make(0x66, 0x66, 0x66), 0);
+        lv_label_set_text(s_ws_label, "WS");
     }
 }
 
 void display_set_wifi_status(bool connected, int rssi)
 {
     if (!display_lvgl_lock(100)) return;
-    ensure_bottom_panel();
+    ensure_wifi_top();
 
     // WiFi icon color based on signal strength
     lv_color_t icon_col;
@@ -450,6 +474,28 @@ void display_mqtt_rx_pulse(void)
     esp_timer_start_once(s_dim_timer_rx, 300 * 1000);  // 300 ms
 }
 
+void display_set_ws_status(bool player_connected, bool recorder_connected)
+{
+    if (!display_lvgl_lock(100)) return;
+    ensure_bottom_panel();
+
+    #define WS_DOT_ON   lv_color_make(0x00, 0xFF, 0x88)   // green
+    #define WS_DOT_OFF  lv_color_make(0x33, 0x33, 0x33)   // dim
+
+    lv_obj_set_style_bg_color(s_ws_dot_player,
+        player_connected ? WS_DOT_ON : WS_DOT_OFF, 0);
+    lv_obj_set_style_bg_color(s_ws_dot_recorder,
+        recorder_connected ? WS_DOT_ON : WS_DOT_OFF, 0);
+
+    // WS label green if either connected, gray if both off
+    lv_obj_set_style_text_color(s_ws_label,
+        (player_connected || recorder_connected)
+            ? lv_color_make(0x00, 0xFF, 0x88)
+            : lv_color_make(0x66, 0x66, 0x66), 0);
+
+    display_lvgl_unlock();
+}
+
 void display_set_battery(int percent, bool charging)
 {
     if (!display_lvgl_lock(100)) return;
@@ -484,11 +530,14 @@ static void enforce_z_order(void)
     if (s_avatar_img)   lv_obj_move_foreground(s_avatar_img);
     if (s_label)        lv_obj_move_foreground(s_label);
     if (s_batt_label)   lv_obj_move_foreground(s_batt_label);
-    if (s_wifi_icon)    lv_obj_move_foreground(s_wifi_icon);
-    if (s_wifi_label)   lv_obj_move_foreground(s_wifi_label);
-    if (s_mqtt_label)   lv_obj_move_foreground(s_mqtt_label);
-    if (s_dot_tx)       lv_obj_move_foreground(s_dot_tx);
-    if (s_dot_rx)       lv_obj_move_foreground(s_dot_rx);
+    if (s_wifi_icon)        lv_obj_move_foreground(s_wifi_icon);
+    if (s_wifi_label)       lv_obj_move_foreground(s_wifi_label);
+    if (s_mqtt_label)       lv_obj_move_foreground(s_mqtt_label);
+    if (s_dot_tx)           lv_obj_move_foreground(s_dot_tx);
+    if (s_dot_rx)           lv_obj_move_foreground(s_dot_rx);
+    if (s_ws_label)         lv_obj_move_foreground(s_ws_label);
+    if (s_ws_dot_player)    lv_obj_move_foreground(s_ws_dot_player);
+    if (s_ws_dot_recorder)  lv_obj_move_foreground(s_ws_dot_recorder);
 }
 
 void display_set_scenario(uint16_t *rgb565, int w, int h)

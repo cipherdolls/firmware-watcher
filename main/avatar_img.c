@@ -96,7 +96,7 @@ static void avatar_task(void *arg)
     char url[256];
     // Request small avatar (20% of display) — scenario image is the full-screen background
     #define AVATAR_SIZE 82
-    snprintf(url, sizeof(url), "%s/avatars/%s/picture.jpg?x=%d&y=%d",
+    snprintf(url, sizeof(url), "%s/pictures/by/avatars/%s/picture.jpg?x=%d&y=%d",
              g_config.server_url, g_config.avatar_id, AVATAR_SIZE, AVATAR_SIZE);
 
     char auth[128];

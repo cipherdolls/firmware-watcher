@@ -27,5 +27,6 @@ void display_mqtt_rx_pulse(void);   // flash RX dot (incoming)
 void display_set_battery(int percent, bool charging);
 void display_set_scenario(uint16_t *rgb565, int w, int h); // takes ownership of rgb565 buffer
 void display_set_avatar(uint16_t *rgb565, int w, int h);   // takes ownership of rgb565 buffer
+void display_set_ws_status(bool player_connected, bool recorder_connected);
 void display_sleep(void);   // turn off backlight (before light sleep)
 void display_wake(void);    // turn backlight back on

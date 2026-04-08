@@ -94,7 +94,7 @@ static void scenario_task(void *arg)
 
     // Build URL
     char url[256];
-    snprintf(url, sizeof(url), "%s/scenarios/%s/picture.jpg?x=%d&y=%d",
+    snprintf(url, sizeof(url), "%s/pictures/by/scenarios/%s/picture.jpg?x=%d&y=%d",
              g_config.server_url, g_config.scenario_id, LCD_H_RES, LCD_V_RES);
 
     char auth[128];

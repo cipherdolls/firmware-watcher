@@ -250,3 +250,19 @@ void mqtt_start(void)
     xTaskCreateStaticPinnedToCore(mqtt_connect_task, "mqtt_connect",
         4096 / sizeof(StackType_t), NULL, 3, stack, &s_mqtt_tcb, 1);
 }
+
+void mqtt_stop(void)
+{
+    if (s_client) {
+        esp_mqtt_client_stop(s_client);
+        ESP_LOGI(TAG, "Stopped");
+    }
+}
+
+void mqtt_reconnect(void)
+{
+    if (s_client) {
+        esp_mqtt_client_start(s_client);
+        ESP_LOGI(TAG, "Reconnecting...");
+    }
+}

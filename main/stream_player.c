@@ -17,7 +17,7 @@ static const char *TAG = "stream_player";
 
 // ── Stream buffer: WS handler (producer) → decode task (consumer) ───────────
 
-#define SP_STREAM_BUF_SIZE  (128 * 1024)
+#define SP_STREAM_BUF_SIZE  (512 * 1024)  // 512 KB — ~10.7 s of PCM at 24 kHz 16-bit mono
 
 static StreamBufferHandle_t  s_sp_stream;
 static StaticStreamBuffer_t  s_sp_stream_struct;
@@ -105,11 +105,13 @@ static void sp_ws_event_handler(void *arg, esp_event_base_t base,
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Connected to stream-player");
         xEventGroupSetBits(g_events, EVT_STREAM_CONNECTED);
+        display_set_ws_status(true, false);  // player dot on
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Disconnected from stream-player");
         xEventGroupClearBits(g_events, EVT_STREAM_CONNECTED);
+        display_set_ws_status(false, false);  // player dot off
         if (s_stream_active) {
             s_stream_active = false;
             s_stream_error  = true;
@@ -137,7 +139,7 @@ static void sp_ws_event_handler(void *arg, esp_event_base_t base,
                 s_text_buf_len = 0;
             }
         } else if (data->op_code == 0x02) {
-            // Binary frame — MP3 audio chunk
+            // Binary frame — raw PCM audio chunk (16-bit, 24 kHz, mono)
             if (s_stream_active && data->data_len > 0) {
                 size_t sent = xStreamBufferSend(s_sp_stream,
                     (const uint8_t *)data->data_ptr, data->data_len,
@@ -159,7 +161,7 @@ static void sp_ws_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-// ── Decode task — reads MP3 from stream buffer, decodes + plays ─────────────
+// ── Playback task — reads PCM from stream buffer, expands + plays ───────────
 
 static void sp_decode_task(void *arg)
 {
@@ -170,10 +172,14 @@ static void sp_decode_task(void *arg)
                                            pdMS_TO_TICKS(5000));
         if (got == 0) continue;
 
-        // Check guards
+        // Check guards — only play during conversation mode
         EventBits_t bits = xEventGroupGetBits(g_events);
-        if (bits & EVT_AUDIO_RECORDING) {
-            ESP_LOGW(TAG, "Recording in progress, discarding stream");
+        if ((bits & EVT_AUDIO_RECORDING) || !(bits & EVT_CONV_MODE)) {
+            if (bits & EVT_AUDIO_RECORDING) {
+                ESP_LOGW(TAG, "Recording in progress, discarding stream");
+            } else {
+                ESP_LOGW(TAG, "Not in conversation mode, discarding stream");
+            }
             while (s_stream_active || xStreamBufferBytesAvailable(s_sp_stream) > 0) {
                 uint8_t discard[256];
                 xStreamBufferReceive(s_sp_stream, discard, sizeof(discard),
@@ -190,55 +196,6 @@ static void sp_decode_task(void *arg)
     }
 }
 
-// ── Connect task — waits for prerequisites, then starts WS client ───────────
-
-static StaticTask_t s_connect_tcb;
-
-static void sp_connect_task(void *arg)
-{
-    xEventGroupWaitBits(g_events, EVT_DOLL_READY | EVT_IMAGES_DONE,
-                        pdFALSE, pdTRUE, portMAX_DELAY);
-
-    if (strlen(g_config.chat_id) == 0) {
-        ESP_LOGW(TAG, "No chat linked — stream-player disabled");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    char url[384];
-    build_ws_player_url(url, sizeof(url));
-
-    esp_websocket_client_config_t ws_cfg = {
-        .uri                    = url,
-        .buffer_size            = 4096,
-        .disable_auto_reconnect = false,
-        .reconnect_timeout_ms   = 5000,
-        .pingpong_timeout_sec   = 30,
-        .task_stack             = 8192,
-        .task_prio              = 3,
-    };
-
-    if (strncmp(url, "wss://", 6) == 0) {
-        ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    }
-
-    s_ws_client = esp_websocket_client_init(&ws_cfg);
-    esp_websocket_register_events(s_ws_client, WEBSOCKET_EVENT_ANY,
-                                   sp_ws_event_handler, NULL);
-    esp_websocket_client_start(s_ws_client);
-    ESP_LOGI(TAG, "Connecting to stream-player (chatId=%.36s)", g_config.chat_id);
-
-    // Start decode task (PSRAM stack, Core 0 for audio decode)
-    static StaticTask_t s_dec_tcb;
-    StackType_t *dec_stack = heap_caps_malloc(32768,
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(dec_stack);
-    xTaskCreateStaticPinnedToCore(sp_decode_task, "sp_decode",
-        32768 / sizeof(StackType_t), NULL, 5, dec_stack, &s_dec_tcb, 0);
-
-    vTaskDelete(NULL);
-}
-
 // ── Public API ──────────────────────────────────────────────────────────────
 
 void stream_player_init(void)
@@ -251,23 +208,30 @@ void stream_player_init(void)
                                              s_sp_stream_storage,
                                              &s_sp_stream_struct);
 
-    // Spawn connect task (PSRAM stack)
-    StackType_t *stack = heap_caps_malloc(4096,
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(stack);
-    xTaskCreateStaticPinnedToCore(sp_connect_task, "sp_connect",
-        4096 / sizeof(StackType_t), NULL, 3, stack, &s_connect_tcb, 1);
+    // Start decode/playback task (runs forever, waits for data in stream buffer)
+    static StaticTask_t s_dec_tcb;
+    StackType_t *dec_stack = heap_caps_malloc(32768,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(dec_stack);
+    xTaskCreateStaticPinnedToCore(sp_decode_task, "sp_decode",
+        32768 / sizeof(StackType_t), NULL, 5, dec_stack, &s_dec_tcb, 0);
 
-    ESP_LOGI(TAG, "Stream-player module initialized");
+    // WS not connected yet — stream_player_resume() connects during conversation
+    ESP_LOGI(TAG, "Stream-player module initialized (disconnected)");
 }
 
 void stream_player_pause(void)
 {
+    // Clear stream state so decode task doesn't replay stale data
+    s_stream_active = false;
+    s_stream_error  = true;   // signal decode task to abort current playback
+    xStreamBufferReset(s_sp_stream);
+
     if (s_ws_client) {
         esp_websocket_client_stop(s_ws_client);
         esp_websocket_client_destroy(s_ws_client);
         s_ws_client = NULL;
-        ESP_LOGI(TAG, "Paused (destroyed WS client to free TLS memory)");
+        ESP_LOGI(TAG, "Paused (destroyed WS client, flushed stream buffer)");
     }
 }
 
